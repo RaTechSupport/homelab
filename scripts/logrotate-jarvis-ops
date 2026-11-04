@@ -1,0 +1,14 @@
+# Install as /etc/logrotate.d/jarvis-ops (root:root 644)
+# Small logs of the jarvis-ops scripts (a few lines per day each): monthly, keep a year, compressed.
+# "create" without arguments = the new file gets the old file's owner and mode (mirror log 600, netstats 640).
+# Add the log of any new script here. (update-ub has its own file: jarvis-update; the backup: homelab-backup.)
+/var/log/jarvis_backup_mirror.log /var/log/jarvis_netstats.log {
+    su root adm
+    monthly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create
+}

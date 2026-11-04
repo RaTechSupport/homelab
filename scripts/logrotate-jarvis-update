@@ -1,0 +1,12 @@
+# Install as /etc/logrotate.d/jarvis-update (root:root 644)
+# Weekly log of update-ub: keep ~6 months, compressed.
+/var/log/jarvis_update.log {
+    su root adm
+    monthly
+    rotate 6
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}

@@ -1,0 +1,2 @@
+# Keep text files with LF line endings on every OS (stops the LF/CRLF warnings).
+* text=auto eol=lf

@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# jarvis-iplist - the home network at a glance (read-only)
+#
+#   jarvis-iplist            all known devices (online + Pi-hole leases/static leases)
+#   jarvis-iplist --online   only devices answering right now
+#
+# Sources: ping sweep + neighbour table (who is online), Pi-hole static leases,
+# Pi-hole DHCP leases (/etc/pihole/dhcp.leases), Pi-hole's network table (names),
+# manufacturer from the IEEE OUI list (/usr/share/ieee-data/oui.txt). Device type is a best guess from
+# manufacturer + name. Needs docker access (docker group or sudo).
+# ==============================================================================
+set -uo pipefail
+
+SUBNET=192.168.1
+IFACE=enp3s0
+LEASES=/etc/pihole/dhcp.leases
+ONLINE_ONLY=0
+case "${1:-}" in
+  --online) ONLINE_ONLY=1 ;;
+  -h|--help) sed -n '3,12p' "$0"; exit 0 ;;
+  "") ;;
+  *) echo "usage: jarvis-iplist [--online]"; exit 1 ;;
+esac
+
+if ! docker ps >/dev/null 2>&1; then
+  echo "Needs docker access: run as a docker-group user or with sudo."; exit 1
+fi
+
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+
+# 1. Who is online: parallel ping sweep fills the neighbour table.
+for i in $(seq 1 254); do ping -c1 -W1 "$SUBNET.$i" >/dev/null 2>&1 & done; wait
+ip -4 neigh show dev "$IFACE" | awk -v s="$SUBNET." '
+  index($1, s) == 1 && /lladdr/ && !/FAILED|INCOMPLETE/ {
+    for (i = 1; i <= NF; i++) if ($i == "lladdr") printf "ON\t%s\t%s\t\t\n", tolower($(i+1)), $1 }' > "$tmp/data"
+self_ip=$(ip -4 -o addr show dev "$IFACE" | awk '{split($4, a, "/"); print a[1]; exit}')
+self_mac=$(tr 'A-F' 'a-f' < "/sys/class/net/$IFACE/address")
+printf 'SELF\t%s\t%s\t%s\t\n' "$self_mac" "$self_ip" "$(hostname)" >> "$tmp/data"
+
+# 2. Pi-hole static leases ("mac,ip[,name]" entries in a JSON array).
+docker exec pihole pihole-FTL --config dhcp.hosts 2>/dev/null | tr -d '[]"' | sed 's/, /\n/g' | tr -d ' ' |
+  awk -F, 'NF >= 2 {printf "ST\t%s\t%s\t%s\t\n", tolower($1), $2, $3}' >> "$tmp/data"
+
+# 3. Pi-hole DHCP leases: "expiry mac ip hostname clientid".
+[[ -r $LEASES ]] && awk '{n = ($4 == "*") ? "" : $4; printf "LE\t%s\t%s\t%s\t\n", tolower($2), $3, n}' "$LEASES" >> "$tmp/data"
+
+# 4. Pi-hole network table: manufacturer + last learned name per MAC.
+docker exec pihole pihole-FTL sqlite3 -separator '|' /etc/pihole/pihole-FTL.db \
+  "SELECT n.hwaddr, IFNULL(n.macVendor,''),
+          IFNULL((SELECT a.name FROM network_addresses a WHERE a.network_id = n.id AND a.name IS NOT NULL
+                  ORDER BY a.lastSeen DESC LIMIT 1), '')
+   FROM network n;" 2>/dev/null |
+  awk -F'|' 'length($1) == 17 && $1 ~ /^[0-9a-f:]+$/ {printf "PH\t%s\t\t%s\t%s\n", $1, $3, $2}' >> "$tmp/data"
+
+# 5. Manufacturer: first 3 bytes of each MAC, looked up in the IEEE OUI list
+#    (Pi-hole runs in a container and cannot see LAN MACs itself).
+OUI=/usr/share/ieee-data/oui.txt
+cut -f2 "$tmp/data" | cut -c1-8 | sort -u > "$tmp/need"
+[[ -r $OUI ]] || OUI=/dev/null
+
+if [[ -t 1 ]]; then G=$'\e[32m'; D=$'\e[2m'; B=$'\e[1m'; N=$'\e[0m'; else G=; D=; B=; N=; fi
+
+awk -F'\t' -v needf="$tmp/need" -v ouif="$OUI" -v gw="$SUBNET.254" -v online_only="$ONLINE_ONLY" -v G="$G" -v D="$D" -v B="$B" -v N="$N" \
+    -v now_utc="$(date -u '+%Y-%m-%d %H:%M UTC')" -v now_et="$(TZ=America/New_York date '+%-I:%M %p %Z')" '
+function guess(v, n, mac,    s, c) {
+  s = tolower(v " " n)
+  if (tolower(n) == "jarvis")                         return "Server (JARVIS)"
+  if (s ~ /at&t gateway/)                             return "Router (gateway)"
+  if (s ~ /airties/)                                  return "Wi-Fi extender (AT&T)"
+  if (s ~ /simplisafe|arlo|blink/)                    return "Security system"
+  if (s ~ /iphone/)                                   return "Phone (iPhone)"
+  if (s ~ /ipad/)                                     return "Tablet (iPad)"
+  if (s ~ /watch/)                                    return "Watch"
+  if (s ~ /macbook|imac|mac-mini|macmini/)            return "Computer (Mac)"
+  if (s ~ /apple ?tv|appletv/)                        return "Streaming (Apple TV)"
+  if (s ~ /raspberry|batocera|retro/)                 return "Raspberry Pi"
+  if (s ~ /galaxy|sm-[a-z][0-9]|pixel|android|razr|motorola/) return "Phone (Android)"
+  if (s ~ /roku/)                                     return "Streaming (Roku)"
+  if (s ~ /chromecast|google|nest|fuchsia/)           return "Google/Nest device"
+  if (s ~ /amazon|echo|kindle|fire ?tv|firetv/)       return "Amazon (Echo/Fire)"
+  if (s ~ /homepod/)                                  return "Speaker (HomePod)"
+  if (s ~ /sonos/)                                    return "Speaker (Sonos)"
+  if (s ~ /playstation|sony interactive|nintendo|xbox/) return "Game console"
+  if (s ~ /lg electronics|vizio|tcl|hisense|samsung.*tv|bravia/) return "TV"
+  if (s ~ /samsung/)                                  return "Samsung device"
+  if (s ~ /hewlett|hp inc|brother|epson|canon|xerox|lexmark/) return "Printer"
+  if (s ~ /bulb|treatlife|espressif|tuya|shelly|ring|wyze|ecobee|ezviz|eufy|kasa|meross|sweeper|roborock|irobot/) return "Smart home / IoT"
+  if (s ~ /tp-link|tplink|netgear|eero|linksys|ubiquiti|arris|commscope|plume|extender|deco/) return "Network gear"
+  if (s ~ /inventec|intel|realtek|dell|lenovo|micro-star|msi|asustek|gigabyte|azurewave|liteon|desktop|laptop/) return "Computer"
+  if (s ~ /apple/)                                    return "Apple device"
+  c = tolower(substr(mac, 2, 1))
+  if (c ~ /[26ae]/)                                   return "Phone/tablet (private MAC)"
+  return "Unknown"
+}
+FILENAME == needf { need[$1] = 1; next }
+FILENAME == ouif {
+  if (index($0, "(hex)")) { p = tolower(substr($0, 1, 8)); gsub("-", ":", p)
+    if (p in need) { v = $0; sub(/^.*\(hex\)[ \t]*/, "", v); sub(/\r$/, "", v); oui[p] = v } }
+  next
+}
+{
+  gsub(/\r/, "")    # vendor names from Pi-hole can end in CR (the IEEE list is CRLF)
+  tag = $1; mac = $2; ip = $3; nm = $4; vd = $5
+  seen[mac] = 1
+  if (tag == "ON" || tag == "SELF") { on[mac] = 1; oip[mac] = ip }
+  if (tag == "SELF") { self[mac] = 1; sname[mac] = nm }
+  if (tag == "ST") { st[mac] = 1; sip[mac] = ip; if (nm != "") sname[mac] = nm }
+  if (tag == "LE") { le[mac] = 1; lip[mac] = ip; if (nm != "") lname[mac] = nm }
+  if (tag == "PH") { if (vd != "") vend[mac] = vd; if (nm != "") pname[mac] = nm }
+}
+END {
+  n = 0; nonline = 0
+  for (m in seen) {
+    if (!(m in on) && !(m in st) && !(m in le)) continue      # only in Pi-hole history: skip
+    ipa = (m in oip) ? oip[m] : ((m in lip) ? lip[m] : sip[m])
+    if (ipa == "") continue
+    name = (m in sname) ? sname[m] : ((m in lname) ? lname[m] : ((m in pname) ? pname[m] : "-"))
+    v = (m in vend) ? vend[m] : ((substr(m, 1, 8) in oui) ? oui[substr(m, 1, 8)] : "")
+    if (ipa == gw && name == "-") name = "AT&T gateway"
+    src = (m in self) ? "this host" : (ipa == gw) ? "gateway" : ((m in st) ? "static" : ((m in le) ? "dhcp" : "manual?"))
+    stat = (m in on) ? "online" : "offline"
+    if (m in on) nonline++
+    if (online_only && !(m in on)) continue
+    split(ipa, o, "."); key = sprintf("%03d", o[4])
+    row[key "-" m] = sprintf("%-15s|%s|%-22.22s|%-26.26s|%-24.24s|%-17s|%s", ipa, stat, name, guess(v, name, m), (v == "" ? "-" : v), m, src)
+    keys[++n] = key "-" m
+  }
+  # sort keys (simple insertion sort, n is small)
+  for (i = 2; i <= n; i++) { k = keys[i]; j = i - 1; while (j > 0 && keys[j] > k) { keys[j+1] = keys[j]; j-- } keys[j+1] = k }
+  printf "%sJARVIS network%s  %s (%s)   online %d / listed %d\n\n", B, N, now_utc, now_et, nonline, n
+  printf "%s%-15s %-7s %-22s %-26s %-24s %-17s %s%s\n", B, "IP", "STATUS", "NAME", "TYPE (guess)", "MANUFACTURER", "MAC", "ADDRESS", N
+  for (i = 1; i <= n; i++) {
+    split(row[keys[i]], f, "|")
+    col = (f[2] == "online") ? G : D
+    printf "%s%-15s %-7s %s %s %s %s %s%s\n", col, f[1], f[2], f[3], f[4], f[5], f[6], f[7], N
+  }
+  print ""
+  print "ADDRESS: static = Pi-hole static lease | dhcp = Pi-hole dynamic lease | manual? = online but no Pi-hole lease"
+  print "         (set on the device, or still on an old lease from the AT&T gateway)"
+}' "$tmp/need" "$OUI" "$tmp/data"

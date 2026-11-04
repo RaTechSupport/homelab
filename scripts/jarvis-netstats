@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# jarvis-netstats v1.1 - root cron hourly: collect Pi-hole DNS/ad-blocking and DHCP data into CSV files for later analysis
+#
+#   sudo jarvis-netstats             collect now (DHCP snapshot + summarize finished UTC days not saved yet)
+#   jarvis-netstats --report         last 7 days at a glance (DNS, top blocked, new devices; adm group or sudo)
+#
+# Data: /var/lib/jarvis-netstats/*.csv (root:adm, 640: admin can read them without sudo); README.txt there
+# explains every file and column. Sources (all read-only): Pi-hole's query database via
+# `docker exec pihole pihole-FTL sqlite3 -readonly`, /etc/pihole/dhcp.leases, Pi-hole's static leases, the IEEE
+# OUI list. Days are UTC. Finished days missing from the CSVs are backfilled from Pi-hole's database (it keeps
+# ~91 days), at most 7 per run. Root cron `5 * * * *`. Log: /var/log/jarvis_netstats.log.
+# Backed up by homelab-backup.sh (HOST_PATHS). Source: homelab repo, scripts/jarvis-netstats.
+# v1.1 (2026-11-03): strip the CR from sqlite CSV output (v1.0 stopped at the first database read).
+set -uo pipefail
+umask 027
+
+OUT=/var/lib/jarvis-netstats
+LOG=/var/log/jarvis_netstats.log
+LEASES=/etc/pihole/dhcp.leases
+OUI=/usr/share/ieee-data/oui.txt
+FTLDB=/etc/pihole/pihole-FTL.db
+GRAVDB=/etc/pihole/gravity.db
+BLOCKED='1,4,5,6,7,8,9,10,11,15,16,18'      # Pi-hole v6 status codes: blocked (gravity, regex, denylist, upstream, ...)
+CACHED='3,17'                               # answered from Pi-hole's cache (17 = stale cache)
+BACKFILL_MAX=7
+TOP=25
+
+S_HDR="date_utc,queries,blocked,blocked_pct,cached_pct,forwarded,fwd_avg_ms,fwd_lt10ms,fwd_10_100ms,fwd_100_500ms,fwd_gt500ms,nxdomain,servfail,clients,domains,gravity_domains,adlists_enabled,dhcp_leases_max,dhcp_new_devices"
+
+log()  { echo "[$(date -u '+%F %T')] $*" >> "$LOG"; }
+hdr()  { [[ -s $1 ]] || echo "$2" > "$1"; }                        # create a CSV with its header line
+csv()  { tr ',' ' ' <<<"$1"; }                                        # keep free text out of the CSV separators
+
+report() {
+  local f=$OUT/daily_summary.csv cutoff
+  [[ -r $f ]] || { echo "no data yet (or no read access): $f"; return 1; }
+  cutoff=$(date -u -d '7 days ago' +%F)
+  echo "== DNS per UTC day (last 7): blocked/cached in %, forwarded = asked Unbound, fwd_avg_ms = Unbound answer time"
+  { head -n1 "$f"; tail -n +2 "$f" | tail -n 7; } | cut -d, -f1-7,11,13,14,18,19 | column -s, -t
+  echo; echo "== top 10 blocked domains, last 7 days"
+  awk -F, -v c="$cutoff" 'NR > 1 && $1 >= c {n[$2] += $3} END {for (d in n) printf "%8d  %s\n", n[d], d}' \
+    "$OUT/daily_top_blocked.csv" 2>/dev/null | sort -rn | head -n 10
+  echo; echo "== DHCP: newest devices (first seen)"
+  { head -n1 "$OUT/dhcp_devices.csv"; grep ',new$' "$OUT/dhcp_devices.csv" | tail -n 5; } 2>/dev/null | column -s, -t
+}
+
+case "${1:-}" in
+  --report) report; exit $? ;;
+  -h|--help) sed -n '3,12p' "$0"; exit 0 ;;
+  "") ;;
+  *) echo "usage: sudo jarvis-netstats | jarvis-netstats --report"; exit 1 ;;
+esac
+(( EUID == 0 )) || { echo "Run with sudo: sudo jarvis-netstats"; exit 1; }
+exec 8>/var/lock/jarvis-netstats.lock
+flock -n 8 || exit 0                                                  # previous run still busy
+install -d -o root -g adm -m 2750 "$OUT"                              # setgid: new files get group adm
+
+docker inspect -f '{{.State.Running}}' pihole 2>/dev/null | grep -q true || { log "ERROR: pihole container not running"; exit 1; }
+NICE_IN=(nice -n 19); docker exec pihole nice -n 19 true >/dev/null 2>&1 || NICE_IN=()
+q() {   # read-only query; sqlite's CSV mode ends lines with CRLF, so strip the CR (v1.1)
+  docker exec pihole "${NICE_IN[@]}" pihole-FTL sqlite3 -readonly -csv "$1" ".timeout 30000" "$2" | tr -d '\r'
+}
+
+oui_vendor() {   # manufacturer for a MAC (IEEE list is CRLF); randomized MACs have no vendor
+  local m=${1,,} p
+  [[ ${m:1:1} == [26ae] ]] && { echo "private (randomized) MAC"; return; }
+  p=$(tr 'a-f' 'A-F' <<<"${m:0:2}-${m:3:2}-${m:6:2}")
+  grep -m1 "^$p " "$OUI" 2>/dev/null | sed -E 's/^.*\(hex\)[[:space:]]*//; s/\r$//'
+}
+
+# ---- 1. DHCP snapshot (every run) ----
+dhcp_snapshot() {
+  local now static total=0 st=0 newc=0 src=new mac ip host vendor
+  now=$(date -u '+%F %H:%M')
+  hdr "$OUT/dhcp_hourly.csv"  "utc_time,leases,static_active,dynamic_active,new_devices"
+  hdr "$OUT/dhcp_devices.csv" "first_seen_utc,mac,ip,hostname,vendor,source"
+  (( $(wc -l < "$OUT/dhcp_devices.csv") <= 1 )) && src=initial   # first run: today's devices are not "new"
+  static=$(docker exec pihole pihole-FTL --config dhcp.hosts 2>/dev/null | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | tr 'A-F' 'a-f')
+  [[ -r $LEASES ]] || { log "ERROR: $LEASES not readable"; return 1; }
+  while read -r _ mac ip host _; do                                  # lease line: expiry mac ip hostname clientid
+    [[ -n ${mac:-} ]] || continue
+    mac=${mac,,}; total=$((total + 1))
+    grep -qx "$mac" <<<"$static" && st=$((st + 1))
+    if ! grep -q ",$mac," "$OUT/dhcp_devices.csv"; then
+      [[ $host == '*' ]] && host=
+      vendor=$(oui_vendor "$mac")
+      echo "$now,$mac,$ip,$(csv "$host"),$(csv "$vendor"),$src" >> "$OUT/dhcp_devices.csv"
+      if [[ $src == new ]]; then newc=$((newc + 1)); log "new device: $mac $ip ${host:--} (${vendor:-unknown vendor})"; fi
+    fi
+  done < "$LEASES"
+  echo "$now,$total,$st,$((total - st)),$newc" >> "$OUT/dhcp_hourly.csv"
+}
+
+# ---- 2. DNS day summaries (finished UTC days; written all-or-nothing) ----
+summarize_day() {   # $1 = YYYY-MM-DD (UTC)
+  local d=$1 s e w t row g='' a='' lmax newd
+  s=$(date -u -d "$d" +%s); e=$((s + 86400)); w="timestamp >= $s AND timestamp < $e"
+  t=$(mktemp -d) || return 1
+  row=$(q "$FTLDB" "SELECT COUNT(*), SUM(status IN ($BLOCKED)),
+          ROUND(100.0 * SUM(status IN ($BLOCKED)) / MAX(COUNT(*), 1), 1), ROUND(100.0 * SUM(status IN ($CACHED)) / MAX(COUNT(*), 1), 1),
+          SUM(status = 2), ROUND(1000 * AVG(CASE WHEN status = 2 THEN reply_time END), 1),
+          SUM(status = 2 AND reply_time < 0.01), SUM(status = 2 AND reply_time >= 0.01 AND reply_time < 0.1),
+          SUM(status = 2 AND reply_time >= 0.1 AND reply_time < 0.5), SUM(status = 2 AND reply_time >= 0.5),
+          SUM(reply_type = 2), SUM(reply_type = 7), COUNT(DISTINCT client), COUNT(DISTINCT domain)
+        FROM queries WHERE $w;") && [[ -n $row ]] || { rm -rf "$t"; return 1; }
+  q "$FTLDB" "SELECT '$d', CAST((timestamp - $s) / 3600 AS INTEGER), COUNT(*), SUM(status IN ($BLOCKED)), SUM(status = 2),
+        ROUND(1000 * AVG(CASE WHEN status = 2 THEN reply_time END), 1) FROM queries WHERE $w GROUP BY 2 ORDER BY 2;" > "$t/hourly" &&
+  q "$FTLDB" "SELECT '$d', q.client, IFNULL((SELECT a.name FROM network_addresses a WHERE a.ip = q.client AND a.name IS NOT NULL
+        ORDER BY a.lastSeen DESC LIMIT 1), ''), COUNT(*), SUM(status IN ($BLOCKED)), ROUND(100.0 * SUM(status IN ($BLOCKED)) / COUNT(*), 1),
+        ROUND(1000 * AVG(CASE WHEN status = 2 THEN reply_time END), 1) FROM queries q WHERE $w GROUP BY q.client ORDER BY 4 DESC;" > "$t/clients" &&
+  q "$FTLDB" "SELECT '$d', domain, COUNT(*) FROM queries WHERE $w AND status IN ($BLOCKED) GROUP BY domain ORDER BY 3 DESC LIMIT $TOP;" > "$t/blocked" &&
+  q "$FTLDB" "SELECT '$d', domain, COUNT(*) FROM queries WHERE $w AND status NOT IN ($BLOCKED) GROUP BY domain ORDER BY 3 DESC LIMIT $TOP;" > "$t/permitted" \
+    || { rm -rf "$t"; return 1; }
+  if [[ $d == "$(date -u -d yesterday +%F)" ]]; then                  # blocklist size is only known for "now"
+    g=$(q "$GRAVDB" "SELECT value FROM info WHERE property = 'gravity_count';" 2>/dev/null | tr -d '"')
+    a=$(q "$GRAVDB" "SELECT COUNT(*) FROM adlist WHERE enabled = 1;" 2>/dev/null)
+  fi
+  lmax=$(awk -F, -v d="$d" 'substr($1, 1, 10) == d && $2 + 0 > m {m = $2 + 0} END {if (m) print m}' "$OUT/dhcp_hourly.csv")
+  newd=; grep -q "^$d" "$OUT/dhcp_hourly.csv" && newd=$(grep -c "^$d.*,new$" "$OUT/dhcp_devices.csv")
+  hdr "$OUT/daily_hourly.csv"        "date_utc,hour_utc,queries,blocked,forwarded,fwd_avg_ms";        cat "$t/hourly"    >> "$OUT/daily_hourly.csv"
+  hdr "$OUT/daily_clients.csv"       "date_utc,client_ip,name,queries,blocked,blocked_pct,fwd_avg_ms"; cat "$t/clients"   >> "$OUT/daily_clients.csv"
+  hdr "$OUT/daily_top_blocked.csv"   "date_utc,domain,count";                                          cat "$t/blocked"   >> "$OUT/daily_top_blocked.csv"
+  hdr "$OUT/daily_top_permitted.csv" "date_utc,domain,count";                                          cat "$t/permitted" >> "$OUT/daily_top_permitted.csv"
+  hdr "$OUT/daily_summary.csv" "$S_HDR"
+  echo "$d,$row,$g,$a,$lmax,$newd" >> "$OUT/daily_summary.csv"        # written last = the day is complete
+  rm -rf "$t"
+  log "summarized $d: $(cut -d, -f1-3 <<<"$row" | tr ',' ' ') (queries blocked blocked%)"
+}
+
+dhcp_snapshot || log "ERROR: DHCP snapshot failed"
+
+last=$(tail -n +2 "$OUT/daily_summary.csv" 2>/dev/null | tail -n1 | cut -d, -f1)
+if [[ -n $last ]]; then day=$(date -u -d "$last + 1 day" +%F)
+else
+  oldest=$(q "$FTLDB" "SELECT CAST(MIN(timestamp) AS INTEGER) FROM query_storage;")
+  [[ $oldest =~ ^[0-9]+$ ]] || { log "ERROR: cannot read Pi-hole's query database"; exit 1; }
+  day=$(date -u -d "@$((oldest + 86400))" +%F)                        # first COMPLETE day in Pi-hole's database
+fi
+yesterday=$(date -u -d yesterday +%F); n=0
+while [[ ! $day > $yesterday ]] && (( n < BACKFILL_MAX )); do
+  summarize_day "$day" || { log "ERROR: summary of $day failed (retried next run)"; exit 1; }
+  day=$(date -u -d "$day + 1 day" +%F); n=$((n + 1))
+done
+
+cat > "$OUT/README.txt" <<'EOF'
+jarvis-netstats data (written hourly by /usr/local/sbin/jarvis-netstats; days and times are UTC)
+
+daily_summary.csv       one line per day: queries, blocked (+%), cached %, forwarded (= asked Unbound),
+                        fwd_avg_ms + forwarded answer-time buckets (<10, 10-100, 100-500, >500 ms),
+                        NXDOMAIN, SERVFAIL, distinct clients and domains, blocklist size and enabled
+                        adlists (only for days summarized the day after), DHCP max leases + new devices
+                        (empty for days before the collector ran).
+daily_hourly.csv        per day and UTC hour: queries, blocked, forwarded, fwd_avg_ms (busy hours, slow hours).
+daily_clients.csv       per day and client: queries, blocked (+%), fwd_avg_ms (who is chatty / heavily blocked).
+daily_top_blocked.csv   per day: 25 most-blocked domains (allowlist/blocklist tuning).
+daily_top_permitted.csv per day: 25 most-queried allowed domains (candidates to block, CDN load).
+dhcp_hourly.csv         every hour: active Pi-hole leases (static / dynamic) and new devices seen.
+dhcp_devices.csv        every MAC ever seen in a Pi-hole lease: first seen, IP, hostname, vendor,
+                        source (initial = present at the first run, new = joined later).
+Devices with a manually set IP (no lease) do not appear in the DHCP files.
+Quick look: jarvis-netstats --report
+EOF
+exit 0

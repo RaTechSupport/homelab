@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# jarvis-commands - every custom JARVIS command: how to run it and what it does (read-only)
+#
+#   jarvis-commands          list of the custom commands
+#   sudo jarvis-commands     same, plus the real schedules from root's crontab
+#
+# Finds every executable in /usr/local/bin and /usr/local/sbin, so a newly installed
+# script shows up here automatically. The text comes from the script's own header:
+#   # <name> [vX.Y] - <one-line description>      (newest vX.Y in the header = version)
+#   #   [sudo] <name> [args]    <explanation>      (usage lines: 2+ spaces after the #)
+# Scripts without that header, or root-only ones (mode 750), fall back to HINTS below.
+# Source: homelab repo, scripts/jarvis-commands.
+# ==============================================================================
+set -uo pipefail
+
+DIRS=(/usr/local/bin /usr/local/sbin)
+
+# name | cron spec (or -) | manual usage | description   (fallback only: the header wins)
+HINTS='storage-watchdog.sh|* * * * *||checks the 6TB drive mount, reports to Uptime Kuma monitor 6
+dhcp-watchdog.sh|*/5 * * * *||
+dns-watchdog.sh|* * * * *||
+homelab-backup.sh|0 7 * * *|sudo homelab-backup.sh|
+update-ub|0 6 * * 0|sudo update-ub|
+jarvis-audit.sh|-|sudo jarvis-audit.sh [--deep]|
+ufw-docker|-|sudo ufw-docker help|third-party tool: ufw firewall rules for Docker containers'
+
+case "${1:-}" in
+  -h|--help) sed -n '3,13p' "$0"; exit 0 ;;
+  "") ;;
+  *) echo "usage: jarvis-commands"; exit 1 ;;
+esac
+
+if [[ -t 1 ]]; then B=$'\e[1m'; D=$'\e[2m'; C=$'\e[36m'; Y=$'\e[33m'; N=$'\e[0m'; else B=; D=; C=; Y=; N=; fi
+cols=$(tput cols 2>/dev/null || echo 120); (( cols < 80 )) && cols=80
+is_root=0; (( EUID == 0 )) && is_root=1
+
+human() {  # cron spec -> plain English for the common patterns, else the raw spec
+  local m=$1 h=$2 dom=$3 mon=$4 dow=$5 days=(Sun Mon Tue Wed Thu Fri Sat Sun) hm
+  if [[ "$m $h $dom $mon $dow" == "* * * * *" ]]; then echo "every minute"; return; fi
+  if [[ $m == '*/'* && "$h $dom $mon $dow" == "* * * *" ]]; then echo "every ${m#*/} min"; return; fi
+  if [[ $m =~ ^[0-9]+$ && $h =~ ^[0-9]+$ && "$dom $mon" == "* *" && $dow =~ ^([0-7]|\*)$ ]]; then
+    hm=$(printf '%02d:%02d' "$((10#$h))" "$((10#$m))")
+    hm="$hm UTC ($(TZ=America/New_York date -d "$(date -u +%F) $hm UTC" '+%-I:%M %p %Z'))"
+    if [[ $dow == '*' ]]; then echo "daily $hm"; else echo "${days[$dow]} $hm"; fi
+    return
+  fi
+  echo "$m $h $dom $mon $dow"
+}
+
+parse() {  # script header -> version US description US usage1 RS usage2 ...
+  head -n 40 "$1" 2>/dev/null | awk -v n="${1##*/}" '
+    function newer(a, b,    x, y, i, k) {
+      k = split(substr(a, 2), x, "."); split(substr(b, 2), y, ".")
+      for (i = 1; i <= k; i++) if (x[i] + 0 != y[i] + 0) return (x[i] + 0 > y[i] + 0)
+      return 0
+    }
+    !/^#/ { next }
+    {
+      l = substr($0, 2); s = l; sub(/^[ \t]+/, "", s); ind = length(l) - length(s)
+      while (match(l, /v[0-9]+\.[0-9]+(\.[0-9]+)?/)) {
+        v = substr(l, RSTART, RLENGTH); if (ver == "" || newer(v, ver)) ver = v
+        l = substr(l, RSTART + RLENGTH)
+      }
+      if (desc == "" && ind <= 1 && index(s, n " ") == 1) {
+        r = substr(s, length(n) + 1); sub(/^[ \t]+v[0-9][0-9.]*/, "", r)
+        if (r ~ /^[ \t]+-[ \t]+/) { sub(/^[ \t]+-[ \t]+/, "", r); desc = r }
+      } else if (ind >= 2) {
+        u = s; sub(/^sudo bash /, "sudo ", u)
+        if (index(u, n) == 1 || index(u, "sudo " n) == 1) {
+          sub(/[ \t][ \t].*$/, "", u); use = use (use == "" ? "" : "\036") u
+        }
+      }
+    }
+    END { printf "%s\037%s\037%s\n", ver, desc, use }'
+}
+
+declare -A H_CRON=() H_USE=() H_DESC=() SCHED=()
+while IFS='|' read -r n spec use desc; do
+  H_CRON[$n]=$spec; H_USE[$n]=$use; H_DESC[$n]=$desc
+done <<<"$HINTS"
+
+# Real schedules: root's crontab (readable only as root).
+if (( is_root )); then
+  while read -r m h dom mon dow rest; do
+    [[ -z ${m:-} || $m == '#'* || $m == *=* ]] && continue
+    if [[ $m == @* ]]; then rest="$h $dom $mon $dow $rest"; fi
+    for tok in $rest; do
+      if [[ $tok == /usr/local/* ]]; then
+        if [[ $m == @* ]]; then SCHED[${tok##*/}]=$m; else SCHED[${tok##*/}]=$(human "$m" "$h" "$dom" "$mon" "$dow"); fi
+        break
+      fi
+    done
+  done < <(crontab -l 2>/dev/null)
+fi
+
+trunc() { local w=$(( cols - 30 )); if (( ${#1} > w )); then echo "${1:0:w-3}..."; else echo "$1"; fi; }
+
+manual=(); auto=()
+while IFS= read -r f; do
+  n=${f##*/}; ver=; desc=; use=
+  [[ -r $f ]] && IFS=$'\037' read -r ver desc use < <(parse "$f")
+  [[ -z $desc ]] && desc=${H_DESC[$n]:-"(no description: add a '# $n - ...' header line)"}
+  [[ -z $use ]] && use=${H_USE[$n]:-}
+  when=${SCHED[$n]:-}
+  hint=${H_CRON[$n]:-}
+  if [[ -z $when && -n $hint && $hint != - ]]; then
+    read -r -a spec <<<"$hint"
+    if (( is_root )); then when="${Y}NOT in root's crontab (expected: $(human "${spec[@]}"))${N}"; else when=$(human "${spec[@]}"); fi
+  fi
+  [[ -z $when && $desc == *cron* ]] && when="cron (sudo jarvis-commands shows the schedule)"
+  entry="$n"$'\037'"$ver"$'\037'"$desc"$'\037'"$use"$'\037'"$when"
+  if [[ -n $when ]]; then auto+=("$entry"); else manual+=("$entry"); fi
+done < <(find "${DIRS[@]}" -maxdepth 1 -type f -perm -u+x 2>/dev/null |
+         grep -vE '\.(bak|orig|old)|\.v[0-9]|~$' | awk -F/ '{print $NF "\t" $0}' | sort | cut -f2)
+
+show() {  # one entry: name, version, description, then usage or schedule lines
+  local n ver desc use when u
+  IFS=$'\037' read -r n ver desc use when <<<"$1"
+  printf '  %s%-20s%s %-5s %s\n' "$C" "$n" "$N" "$ver" "$(trunc "$desc")"
+  [[ -n $when ]] && printf '  %26s %swhen:%s %s\n' "" "$D" "$N" "$when"
+  if [[ -n $use ]]; then
+    while IFS= read -r u; do printf '  %26s %s$%s %s\n' "" "$D" "$N" "$u"; done <<<"${use//$'\036'/$'\n'}"
+  fi
+}
+
+printf '%sJARVIS custom commands%s  %s (%s)  from /usr/local/bin + /usr/local/sbin\n\n' "$B" "$N" \
+  "$(date -u '+%Y-%m-%d %H:%M UTC')" "$(TZ=America/New_York date '+%-I:%M %p %Z')"
+printf '%sYOU RUN THESE%s\n' "$B" "$N"
+for e in "${manual[@]}"; do show "$e"; done
+printf '\n%sRUN AUTOMATICALLY (root cron)%s\n' "$B" "$N"
+for e in "${auto[@]}"; do show "$e"; done
+echo
+(( is_root )) || echo "${D}Schedules above are the expected ones; 'sudo jarvis-commands' reads root's real crontab.${N}"
+echo "${D}New script: install it in /usr/local/bin (you run it) or /usr/local/sbin (root/cron) with a"
+echo "'# name - description' header line, and it appears here automatically.${N}"
+echo "${D}Not commands: saved Pi-hole queries and the Portainer recipe are in the homelab repo (scripts/).${N}"

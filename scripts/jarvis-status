@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# jarvis-status - "is anything wrong right now?" at a glance (read-only, ~10 s)
+#
+#   sudo jarvis-status        (needs root: Docker, Kuma DB, root-only backups)
+#
+# Prints one line per check: [ OK ], [WARN], [FAIL] or [INFO], then a summary.
+# Exit code: 0 = all OK, 1 = warnings, 2 = failures.
+# Changes nothing. Prints no secrets, keys or VPN client IPs.
+# For the full deep-dive use: sudo jarvis-audit.sh
+# Replaces the retired jarvis-logs (2026-10-15).
+# v1.1 (2026-10-19): load check shows CPU % and I/O wait, so a busy USB drive
+#                    (big Samba copy, backup) is not mistaken for a CPU problem.
+# v1.2 (2026-10-20): shows updates waiting for Watchtower watch-only containers
+#                    (nextcloud, pihole) and the age of the hand-updated Portainer image.
+# v1.4 (2026-10-25): Pi-hole DHCP check; dhcphelper is an expected container (13).
+# v1.3 (2026-10-20): DNSSEC check (random name under dnssec-failed.org must give SERVFAIL).
+# v1.5 (2026-10-26): uncached DNS check (random name), so a broken Pi-hole -> Unbound
+#                    path is caught even while cached names still resolve.
+# v1.6 (2026-11-03): 3-2-1 chain check: the newest 6TB archive must be on the SSD, in the
+#                    encrypted outbox and in Google Drive (PC report via Kuma monitor 11).
+# v1.7 (2026-11-03): jarvis-netstats freshness (hourly run, daily summaries up to yesterday,
+#                    last run without ERROR) + INFO on devices new to the network in 24 h.
+# ==============================================================================
+set -uo pipefail
+
+# ---- what this node is supposed to look like --------------------------------
+EXPECTED_CONTAINERS=(dhcphelper dockerproxy duckdns homepage nextcloud pihole plex portainer
+                     signal-api unbound uptime-kuma watchtower wg-easy)
+STORAGE=/mnt/6TB_Storage
+BACKUP_DIR=$STORAGE/jarvis_node_backups
+SSD_BACKUP_DIR=/var/backups/jarvis_node_backups
+OUTBOX_DIR=/var/backups/jarvis_outbox/files
+MIRROR_LOG=/var/log/jarvis_backup_mirror.log
+OFFSITE_MONITOR="Off-site copy (Google Drive)"
+BACKUP_LOG=/var/log/homelab-backup.log
+UPDATE_LOG=/var/log/jarvis_update.log
+KUMA_DB=/home/admin/uptime-kuma_data/kuma.db
+NETSTATS_DIR=/var/lib/jarvis-netstats
+NETSTATS_LOG=/var/log/jarvis_netstats.log
+
+if [[ $EUID -ne 0 ]]; then echo "Run with sudo: sudo jarvis-status"; exit 1; fi
+
+# ---- output helpers -----------------------------------------------------------
+if [[ -t 1 ]]; then G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; B=$'\e[36m'; D=$'\e[1m'; N=$'\e[0m'
+else G=; Y=; R=; B=; D=; N=; fi
+N_OK=0; N_WARN=0; N_FAIL=0
+ok()   { printf '  %s[ OK ]%s %s\n' "$G" "$N" "$*"; N_OK=$((N_OK+1)); }
+warn() { printf '  %s[WARN]%s %s\n' "$Y" "$N" "$*"; N_WARN=$((N_WARN+1)); }
+fail() { printf '  %s[FAIL]%s %s\n' "$R" "$N" "$*"; N_FAIL=$((N_FAIL+1)); }
+info() { printf '  %s[INFO]%s %s\n' "$B" "$N" "$*"; }
+section() { printf '\n%s%s%s\n' "$D" "$*" "$N"; }
+age_h() { echo $(( ( $(date +%s) - $(stat -c %Y "$1") ) / 3600 )); }   # file age in hours
+
+printf '%sJARVIS status%s  %s UTC (%s)  host %s, up %s\n' "$D" "$N" \
+  "$(date -u '+%Y-%m-%d %H:%M')" "$(TZ=America/New_York date '+%-I:%M %p %Z')" \
+  "$(hostname)" "$(uptime -p | sed 's/^up //')"
+
+# ---- 1. host --------------------------------------------------------------------
+section "Host"
+read -r _ _ load15 _ < /proc/loadavg
+# Sample /proc/stat for 1 s to split CPU work from waiting on disk (I/O wait counts toward load).
+read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat; sleep 1
+read -r _ u2 n2 s2 i2 w2 q2 sq2 st2 _ < /proc/stat
+tot=$(( (u2+n2+s2+i2+w2+q2+sq2+st2) - (u1+n1+s1+i1+w1+q1+sq1+st1) ))
+iowait=$(( tot > 0 ? (w2 - w1) * 100 / tot : 0 ))
+busy=$(( tot > 0 ? ((u2+n2+s2+q2+sq2+st2) - (u1+n1+s1+q1+sq1+st1)) * 100 / tot : 0 ))
+if awk -v l="$load15" 'BEGIN{exit !(l>4)}'; then
+  if (( iowait >= 40 )); then warn "load (15 min) $load15 on 2 cores - DISK busy (${iowait}% I/O wait; big copy/backup running?)"
+  else warn "load (15 min) $load15 on 2 cores - CPU busy (${busy}% CPU, ${iowait}% I/O wait)"; fi
+else ok "load (15 min) $load15 (now ${busy}% CPU, ${iowait}% I/O wait)"; fi
+
+mem_total=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+mem_avail=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+mem_pct=$(( mem_avail * 100 / mem_total ))
+if   (( mem_pct < 5 ));  then fail "memory available ${mem_pct}%"
+elif (( mem_pct < 10 )); then warn "memory available ${mem_pct}%"
+else ok "memory available ${mem_pct}% ($(( mem_avail / 1024 )) MiB)"; fi
+
+temp=""
+for h in /sys/class/hwmon/hwmon*; do
+  [[ $(cat "$h/name" 2>/dev/null) == coretemp ]] || continue
+  temp=$(cat "$h"/temp*_input 2>/dev/null | sort -n | tail -n1)
+done
+[[ -z $temp && -r /sys/class/thermal/thermal_zone0/temp ]] && temp=$(cat /sys/class/thermal/thermal_zone0/temp)
+if [[ -n $temp ]]; then
+  t=$(( temp / 1000 ))
+  if   (( t >= 95 )); then fail "CPU temperature ${t}°C"
+  elif (( t >= 80 )); then warn "CPU temperature ${t}°C"
+  else ok "CPU temperature ${t}°C"; fi
+else info "CPU temperature not available"; fi
+
+ac=""; bat=""
+for p in /sys/class/power_supply/*; do
+  case "$(cat "$p/type" 2>/dev/null)" in
+    Mains)   ac=$(cat "$p/online" 2>/dev/null) ;;
+    Battery) bat="$(cat "$p/capacity" 2>/dev/null)% $(cat "$p/status" 2>/dev/null)" ;;
+  esac
+done
+if [[ $ac == 0 ]]; then fail "ON BATTERY (power cut?) - battery $bat"
+elif [[ -n $ac ]]; then ok "on mains power, battery $bat"
+else info "power state not available"; fi
+
+failed_units=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
+if [[ -n ${failed_units// /} ]]; then fail "failed systemd units: $failed_units"
+else ok "no failed systemd units"; fi
+
+if [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]]; then ok "clock NTP-synchronised"
+else warn "clock NOT NTP-synchronised"; fi
+
+io_err=$(journalctl -k -b -p err --no-pager 2>/dev/null | grep -ciE 'I/O error|EXT4-fs error|reset high-speed|link is down' || true)
+if (( io_err > 0 )); then fail "$io_err disk/USB error line(s) in the kernel log since boot (journalctl -k -b -p err)"
+else ok "no disk/USB errors in the kernel log since boot"; fi
+
+zombies=$(ps -eo stat= | grep -c '^Z' || true)
+if (( zombies > 5 )); then warn "$zombies zombie processes"
+else ok "zombie processes: $zombies"; fi
+
+# ---- 2. storage -------------------------------------------------------------------
+section "Storage"
+for m in / "$STORAGE"; do
+  if [[ $m == "$STORAGE" ]] && ! mountpoint -q "$STORAGE"; then
+    fail "$STORAGE is NOT MOUNTED (Plex/Nextcloud data and backups are on it)"; continue
+  fi
+  use=$(df --output=pcent "$m" | tail -n1 | tr -dc '0-9')
+  free=$(df -h --output=avail "$m" | tail -n1 | tr -d ' ')
+  if   (( use >= 90 )); then fail "$m ${use}% used ($free free)"
+  elif (( use >= 80 )); then warn "$m ${use}% used ($free free)"
+  else ok "$m ${use}% used ($free free)"; fi
+done
+if mountpoint -q "$STORAGE"; then
+  if [[ -r $STORAGE/nextcloud_data ]]; then ok "$STORAGE readable"
+  else fail "$STORAGE mounted but nextcloud_data not readable"; fi
+fi
+
+# ---- 3. backups ---------------------------------------------------------------------
+section "Backups"
+newest=$(ls -1t "$BACKUP_DIR"/jarvis_full_*.tar.gz 2>/dev/null | head -n1)
+if [[ -z $newest ]]; then fail "no backup archive in $BACKUP_DIR"
+else
+  a=$(age_h "$newest")
+  if   (( a > 50 )); then fail "newest backup is ${a}h old: $(basename "$newest")"
+  elif (( a > 26 )); then warn "newest backup is ${a}h old: $(basename "$newest")"
+  else ok "newest backup ${a}h old: $(basename "$newest")"; fi
+  if [[ -s $newest.sha256 ]]; then ok "checksum file present and non-empty"
+  else fail "checksum file missing or EMPTY: $(basename "$newest").sha256"; fi
+fi
+last_bk=$(grep -E 'SUCCESS|FAILED' "$BACKUP_LOG" 2>/dev/null | tail -n1)
+case "$last_bk" in
+  *SUCCESS*) ok "last scheduled backup: SUCCESS (${last_bk:1:16} UTC)" ;;
+  *FAILED*)  fail "last scheduled backup FAILED: $last_bk" ;;
+  *)         warn "no SUCCESS/FAILED line in $BACKUP_LOG" ;;
+esac
+# v1.6: 3-2-1 chain. The newest 6TB archive must reach the SSD, the encrypted outbox (backup-mirror.sh,
+# 07:30 UTC) and Google Drive (the PC's pull reports the file name to Kuma monitor "$OFFSITE_MONITOR").
+newest_of() { find "$1" -maxdepth 1 -name "$2" -printf '%f\n' 2>/dev/null | sort | tail -n1; }  # names sort by time
+stamp_h() {   # hours since the timestamp in an archive name (jarvis_full_YYYYmmdd_HHMMSS...)
+  local s; s=$(grep -oE '[0-9]{8}_[0-9]{6}' <<<"$1" | head -n1); [[ -n $s ]] || { echo 9999; return; }
+  echo $(( ( $(date +%s) - $(date -u -d "${s:0:8} ${s:9:2}:${s:11:2}:${s:13:2}" +%s) ) / 3600 ))
+}
+mirror_hint() {   # a stage lacks the newest archive: mirror not run yet (INFO) or ran/stopped (WARN)
+  local what=$1 have=$2 started=0 line
+  line=$(grep '=== mirror' "$MIRROR_LOG" 2>/dev/null | tail -n1 | cut -c2-20)
+  [[ -n $line ]] && started=$(date -u -d "$line" +%s)
+  if (( started >= $(stat -c %Y "$newest") )); then
+    warn "$what behind: has ${have:-nothing}, newest is $nb (backup-mirror ran since: see $MIRROR_LOG)"
+  elif (( $(date +%s) - started > 26 * 3600 )); then
+    warn "$what behind: has ${have:-nothing}; backup-mirror has not run for over a day (root cron 07:30 UTC)"
+  else
+    info "$what pending: $nb gets mirrored at 07:30 UTC (or now: sudo backup-mirror.sh)"
+  fi
+}
+nb=$(basename "${newest:-}")
+if [[ -n $nb ]]; then
+  s=$(newest_of "$SSD_BACKUP_DIR" 'jarvis_full_*.tar.gz')
+  if [[ $s == "$nb" && -s $SSD_BACKUP_DIR/$nb.sha256 ]]; then
+    ok "SSD copy current ($(find "$SSD_BACKUP_DIR" -maxdepth 1 -name 'jarvis_full_*.tar.gz' | wc -l) copies, keep 14)"
+  else mirror_hint "SSD copy" "$s"; fi
+  o=$(newest_of "$OUTBOX_DIR" 'jarvis_full_*.tar.gz.age')
+  if [[ $o == "$nb.age" ]]; then ok "encrypted copy ready in the outbox for the PC"
+  else mirror_hint "outbox (encrypted copy)" "$o"; fi
+  if command -v sqlite3 >/dev/null && [[ -r $KUMA_DB ]]; then
+    m=$(sqlite3 -readonly "$KUMA_DB" "SELECT h.msg FROM heartbeat h JOIN monitor m ON m.id = h.monitor_id
+          WHERE m.name = '$OFFSITE_MONITOR' ORDER BY h.time DESC LIMIT 1;" 2>/dev/null)
+    c=$(grep -oE 'jarvis_full_[0-9]{8}_[0-9]{6}\.tar\.gz\.age' <<<"$m" | head -n1)
+    if [[ $c == "$nb.age" ]]; then ok "Google Drive copy current (PC reported: ${m#OK })"
+    elif [[ -z $c ]]; then warn "Google Drive copy: no file name in the PC's last report (${m:-none}); see Kuma monitor 11"
+    elif (( $(stamp_h "$c") > 50 )); then warn "Google Drive copy behind: newest there is $c ($(stamp_h "$c")h old); PC off or pull failing?"
+    else info "Google Drive copy pending: the PC pulls at 9:00 AM local and at logon (has $c)"; fi
+  fi
+fi
+last_mr=$(grep -E 'SUCCESS:|ERROR:' "$MIRROR_LOG" 2>/dev/null | tail -n1)
+[[ $last_mr == *ERROR:* ]] && warn "last backup-mirror run failed: ${last_mr:22}"
+
+# ---- 4. containers ------------------------------------------------------------------
+section "Containers"
+if ! systemctl is-active --quiet docker; then
+  fail "Docker daemon is NOT running"
+else
+  bad=()
+  for c in "${EXPECTED_CONTAINERS[@]}"; do
+    st=$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c" 2>/dev/null) \
+      || { bad+=("$c:MISSING"); continue; }
+    case "$st" in
+      "running healthy"|"running "|"running starting") : ;;
+      *) bad+=("$c:${st// /,}") ;;
+    esac
+  done
+  if (( ${#bad[@]} )); then fail "containers not OK: ${bad[*]}"
+  else ok "all ${#EXPECTED_CONTAINERS[@]} expected containers running (none unhealthy)"; fi
+  extra=$(docker ps -a --format '{{.Names}}' | grep -vxF -f <(printf '%s\n' "${EXPECTED_CONTAINERS[@]}") | tr '\n' ' ')
+  [[ -n ${extra// /} ]] && info "other containers present: $extra"
+  restarting=$(docker ps -a --filter status=restarting --format '{{.Names}}' | tr '\n' ' ')
+  [[ -n ${restarting// /} ]] && fail "containers in a restart loop: $restarting"
+fi
+
+# ---- 5. services --------------------------------------------------------------------
+section "Services"
+r=$(dig +short +time=2 +tries=1 @127.0.0.1 example.com 2>/dev/null | head -n1)
+if [[ $r =~ ^[0-9.]+$ ]]; then ok "Pi-hole DNS resolves (example.com -> $r)"
+else fail "Pi-hole DNS does NOT resolve (whole LAN loses DNS)"; fi
+# Upstream path: a random name is never in Pi-hole's cache, so Pi-hole must ask Unbound.
+# The example.com line above stays green from the cache even when Pi-hole cannot reach
+# Unbound (incident 2026-10-26). NOERROR or NXDOMAIN = Unbound answered.
+out=$(dig +time=3 +tries=1 @127.0.0.1 "chk${RANDOM}.example.com" A 2>/dev/null)
+st=$(grep -oE 'status: [A-Z]+' <<<"$out" | cut -d' ' -f2)
+ms=$(grep -oE 'Query time: [0-9]+' <<<"$out" | grep -oE '[0-9]+$')
+case "$st" in
+  NOERROR|NXDOMAIN) ok "Pi-hole -> Unbound works (uncached lookup ${ms:-?} ms)" ;;
+  *) fail "Uncached lookups fail (${st:-timeout}): Pi-hole cannot reach Unbound/internet, only cached names work. Check: docker exec pihole pihole-FTL --config dns.upstreams (expect 172.22.0.54#53)" ;;
+esac
+r=$(dig +short +time=2 +tries=1 @127.0.0.1 doubleclick.net 2>/dev/null | head -n1)
+if [[ $r == 0.0.0.0 ]]; then ok "Pi-hole is blocking ads"
+else warn "Pi-hole not blocking (doubleclick.net -> ${r:-no answer})"; fi
+
+# DNSSEC: a name under the deliberately mis-signed dnssec-failed.org must be REFUSED (SERVFAIL).
+# A random label avoids Pi-hole's cache. (If the internet is down this is also SERVFAIL; the
+# "Pi-hole -> Unbound" line above catches that case.)
+st=$(dig +time=3 +tries=1 @127.0.0.1 "chk${RANDOM}.dnssec-failed.org" A 2>/dev/null | grep -oE 'status: [A-Z]+' | cut -d' ' -f2)
+case "$st" in
+  SERVFAIL) ok "DNSSEC validation active (mis-signed domains are refused)" ;;
+  NOERROR|NXDOMAIN) fail "DNSSEC validation is OFF (mis-signed domain answered $st) - check the trust anchor in Unbound's pi-hole.conf" ;;
+  *) warn "DNSSEC check got no answer (${st:-timeout})" ;;
+esac
+
+# DHCP: Pi-hole is the network's DHCP server since 2026-10-25 (relay: dhcphelper).
+dact=$(docker exec pihole pihole-FTL --config dhcp.active 2>/dev/null)
+if [[ $dact == true ]]; then
+  nleases=$(wc -l < /etc/pihole/dhcp.leases 2>/dev/null || echo 0)
+  lmin=$(( ( $(date +%s) - $(stat -c %Y /etc/pihole/dhcp.leases 2>/dev/null || date +%s) ) / 60 ))
+  ok "Pi-hole DHCP server active ($nleases leases, lease file updated ${lmin} min ago)"
+else
+  fail "Pi-hole DHCP is OFF (new devices get no address). Emergency: AT&T DHCP On, or: docker exec pihole pihole-FTL --config dhcp.active true"
+fi
+
+code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:32400/identity)
+if [[ $code == 200 ]]; then ok "Plex answers"; else fail "Plex not answering (HTTP $code)"; fi
+
+nc=$(curl -sk -m 8 https://127.0.0.1:8443/status.php)
+if   [[ $nc == *'"installed":true'* && $nc == *'"maintenance":false'* ]]; then ok "Nextcloud answers ($(grep -o '"versionstring":"[^"]*"' <<<"$nc" | cut -d'"' -f4))"
+elif [[ $nc == *'"maintenance":true'* ]]; then warn "Nextcloud is in MAINTENANCE mode"
+else fail "Nextcloud not answering"; fi
+
+code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:3001/)
+if [[ $code =~ ^(200|302)$ ]]; then ok "Uptime Kuma answers"; else fail "Uptime Kuma not answering (HTTP $code)"; fi
+
+if ss -Huln 'sport = :51820' | grep -q .; then ok "WireGuard listening on 51820/udp"
+else fail "WireGuard NOT listening on 51820/udp"; fi
+
+if systemctl is-active --quiet smbd; then ok "Samba (smbd) active"; else fail "Samba (smbd) is DOWN"; fi
+
+if ufw status 2>/dev/null | grep -q '^Status: active'; then ok "ufw firewall active"
+else fail "ufw firewall NOT active"; fi
+
+# ---- 6. monitoring ------------------------------------------------------------------
+section "Monitoring (Uptime Kuma's own view)"
+if command -v sqlite3 >/dev/null && [[ -r $KUMA_DB ]]; then
+  q="SELECT m.name, (SELECT status FROM heartbeat h WHERE h.monitor_id=m.id ORDER BY time DESC LIMIT 1) FROM monitor m WHERE m.active=1;"
+  down=(); pending=(); total=0
+  while IFS='|' read -r name st; do
+    total=$((total+1))
+    case "$st" in 0) down+=("$name") ;; 2) pending+=("$name") ;; esac
+  done < <(sqlite3 -readonly "$KUMA_DB" "$q" 2>/dev/null)
+  if (( ${#down[@]} )); then fail "Kuma monitors DOWN: ${down[*]}"
+  elif (( ${#pending[@]} )); then warn "Kuma monitors pending: ${pending[*]}"
+  else ok "all $total Kuma monitors up"; fi
+else info "Kuma database not readable"; fi
+
+# ---- 6b. network statistics (jarvis-netstats, root cron hourly at :05) ---------------
+# v1.7: no Kuma monitor watches the collector, so a silent stop would only show up weeks later.
+section "Network statistics (jarvis-netstats)"
+if [[ -s $NETSTATS_DIR/dhcp_hourly.csv && -s $NETSTATS_DIR/dhcp_devices.csv ]]; then
+  ns_min=$(( ( $(date +%s) - $(stat -c %Y "$NETSTATS_DIR/dhcp_hourly.csv") ) / 60 ))   # written every run
+  known=$(( $(wc -l < "$NETSTATS_DIR/dhcp_devices.csv") - 1 ))
+  if (( ns_min > 125 )); then warn "jarvis-netstats last ran ${ns_min} min ago (root cron hourly at :05; log $NETSTATS_LOG)"
+  else ok "jarvis-netstats collecting (last run ${ns_min} min ago, $known devices known)"; fi
+  # Yesterday's summary is written at 00:05 UTC; allow an hour of slack after midnight.
+  last_day=$(tail -n 1 "$NETSTATS_DIR/daily_summary.csv" 2>/dev/null | cut -d, -f1)
+  want=$(date -u -d '-1 day -65 min' +%F)
+  if [[ $last_day =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && ! $last_day < $want ]]; then
+    ok "daily DNS/ad-blocking statistics up to $last_day ($(( $(wc -l < "$NETSTATS_DIR/daily_summary.csv") - 1 )) days)"
+  elif [[ -n $last_day ]] && (( $(age_h "$NETSTATS_DIR/daily_summary.csv") < 2 )); then
+    info "jarvis-netstats backfilling Pi-hole's history: done up to $last_day (7 days per hourly run)"
+  else warn "daily statistics stuck at ${last_day:-none} (expected $want; see $NETSTATS_LOG)"; fi
+  last_ns=$(grep -E 'summarized |ERROR:' "$NETSTATS_LOG" 2>/dev/null | tail -n1)
+  [[ $last_ns == *ERROR:* ]] && warn "last jarvis-netstats run failed: ${last_ns:22}"
+  newdev=$(awk -F, -v c="$(date -u -d '24 hours ago' '+%F %H:%M')" 'NR > 1 && $6 == "new" && $1 >= c {
+             printf "%s%s %s (%s)", s, $3, ($4 == "" ? "-" : $4), ($5 == "" ? "unknown vendor" : $5); s = "; " }' \
+           "$NETSTATS_DIR/dhcp_devices.csv")
+  [[ -n $newdev ]] && info "new on the network in the last 24 h: $newdev"
+else warn "jarvis-netstats has no data in $NETSTATS_DIR (root cron 5 * * * *?)"; fi
+
+# ---- 7. updates & security -----------------------------------------------------------
+section "Updates & security"
+[[ -f /var/run/reboot-required ]] && warn "reboot required ($(tr '\n' ' ' </var/run/reboot-required.pkgs 2>/dev/null))" || ok "no reboot pending"
+sec=$(apt list --upgradable 2>/dev/null | grep -c -- '-security' || true)
+if (( sec > 0 )); then warn "$sec security update(s) pending (sudo update-ub, or wait for Sunday)"
+else ok "no pending security updates (as of the last apt update)"; fi
+last_up=$(grep -E 'SUCCESS:|PROBLEMS:' "$UPDATE_LOG" 2>/dev/null | tail -n1)
+if [[ -z $last_up ]]; then warn "no update-ub v2 run recorded in $UPDATE_LOG"
+else
+  ts=${last_up:1:19}; up_age=$(( ( $(date +%s) - $(date -d "$ts" +%s 2>/dev/null || echo 0) ) / 86400 ))
+  case "$last_up" in
+    *SUCCESS:*) (( up_age > 8 )) && warn "last update-ub run ${up_age} days ago" || ok "last update-ub: SUCCESS ${up_age}d ago (${last_up##*SUCCESS: })" ;;
+    *) fail "last update-ub run had PROBLEMS: ${last_up##*PROBLEMS: }" ;;
+  esac
+fi
+# Watchtower policy C: watch-only containers get the new image pulled but not applied.
+# "Update waiting" = the image tag now points to a different image than the container runs.
+for c in $(docker ps -a --filter label=com.centurylinklabs.watchtower.monitor-only=true --format '{{.Names}}' 2>/dev/null); do
+  tag=$(docker inspect -f '{{.Config.Image}}' "$c" 2>/dev/null)
+  running=$(docker inspect -f '{{.Image}}' "$c" 2>/dev/null)
+  latest=$(docker image inspect -f '{{.Id}}' "$tag" 2>/dev/null)
+  if [[ -n $latest && $latest != "$running" ]]; then warn "update waiting for $c ($tag): plan it, backup first"
+  else ok "$c: no update waiting (watch-only)"; fi
+done
+if docker inspect portainer >/dev/null 2>&1; then
+  p_created=$(docker image inspect -f '{{.Created}}' "$(docker inspect -f '{{.Image}}' portainer)" 2>/dev/null)
+  p_age=$(( ( $(date +%s) - $(date -d "$p_created" +%s 2>/dev/null || date +%s) ) / 86400 ))
+  if (( p_age > 60 )); then warn "portainer image is ${p_age} days old (not auto-updated): check for an update"
+  else info "portainer image ${p_age} days old (updated by hand, not by Watchtower)"; fi
+fi
+
+ssh_fail=$(journalctl -u ssh --since -24h --no-pager 2>/dev/null | grep -cE 'Failed password|Invalid user' || true)
+if (( ssh_fail > 50 )); then warn "$ssh_fail failed SSH login attempts in 24h"
+else ok "failed SSH login attempts (24h): $ssh_fail"; fi
+
+# ---- summary --------------------------------------------------------------------------
+printf '\n%sSummary:%s %s%d OK%s, %s%d WARN%s, %s%d FAIL%s\n' "$D" "$N" "$G" "$N_OK" "$N" "$Y" "$N_WARN" "$N" "$R" "$N_FAIL" "$N"
+if   (( N_FAIL )); then exit 2
+elif (( N_WARN )); then exit 1
+else exit 0; fi

@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# update-ub v2.1 - weekly maintenance for JARVIS (Ubuntu 26.04 + Docker)
+# v2.1 (2026-10-15): reports packages actually upgraded (v2 counted "available",
+#                    which included phasing-held packages) and real Docker upgrades.
+#
+# Schedule (root crontab): 0 6 * * 0  = Sundays 06:00 UTC (2:00 AM EDT / 1:00 AM EST),
+# one hour before the nightly backup (07:00 UTC).
+#
+#   1. apt update + non-interactive upgrade (keeps local config files)
+#   2. apt autoremove + clean
+#   3. docker IMAGE prune only (images unused for 7+ days)
+#   4. journald vacuum (keep 14 days)
+#   5. report: packages upgraded, reboot needed?, containers not running
+#   6. report success/failure to an Uptime Kuma push monitor
+#
+# Log:   /var/log/jarvis_update.log (rotated by /etc/logrotate.d/jarvis-update)
+# Kuma:  push URL in /root/.kuma_push_update_url (root-only, 600)
+# Lock:  shares /var/lock/homelab-backup.lock with homelab-backup.sh, so an
+#        apt/Docker upgrade and the backup's container stops never overlap.
+#
+# Changes from v1 (2026-07-24):
+#   - "docker system prune -af" replaced by "docker image prune -af": v1 also deleted
+#     stopped containers and any network unused at that moment (risky right after
+#     an apt upgrade restarts Docker).
+#   - per-step error handling, Kuma push, reboot-needed and stopped-container report,
+#     UTC timestamps, shared lock, log rotation.
+# Manual run:  sudo update-ub        (prints progress and writes the same log)
+# ==============================================================================
+set -uo pipefail
+
+LOG_FILE=/var/log/jarvis_update.log
+KUMA_PUSH_FILE=/root/.kuma_push_update_url
+LOCK_FILE=/var/lock/homelab-backup.lock
+JOURNAL_KEEP=14d
+IMAGE_MIN_AGE=168h          # 7 days
+SETTLE_SECONDS=90           # a Docker upgrade restarts every container; wait before checking
+
+if [[ $EUID -ne 0 ]]; then
+  echo "[-] Please run as root: sudo update-ub"
+  exit 1
+fi
+
+log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" "$*" | tee -a "$LOG_FILE"; }
+
+notify() {   # notify up|down "message"  -> Uptime Kuma push monitor
+  if [[ ! -r $KUMA_PUSH_FILE ]]; then
+    log "note: $KUMA_PUSH_FILE not found, Kuma not notified"
+    return 0
+  fi
+  local url
+  url="$(head -n1 "$KUMA_PUSH_FILE")"
+  url="${url%%\?*}"
+  curl -fsS -m 15 --retry 12 --retry-delay 5 --retry-connrefused \
+       --get --data-urlencode "status=$1" --data-urlencode "msg=$2" \
+       "$url" >/dev/null 2>&1 || log "note: Kuma push failed"
+}
+
+FAILED=()
+step() {     # step "description" command...   (command output goes to the log only)
+  local desc=$1; shift
+  log "$desc"
+  if ! "$@" >>"$LOG_FILE" 2>&1; then
+    log "  FAILED: $desc"
+    FAILED+=("$desc")
+  fi
+}
+
+exec 9>"$LOCK_FILE"
+if ! flock -w 1800 9; then
+  log "lock $LOCK_FILE busy for 30 min (backup running?); skipping this week"
+  notify down "update-ub skipped: lock busy"
+  exit 1
+fi
+
+log "==================== weekly maintenance start ===================="
+export DEBIAN_FRONTEND=noninteractive
+APT_OPTS=(-y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+step "apt-get update" apt-get update -q
+AVAILABLE_LIST="$(apt list --upgradable 2>/dev/null | grep upgradable || true)"
+AVAILABLE=0
+[[ -n $AVAILABLE_LIST ]] && AVAILABLE=$(wc -l <<<"$AVAILABLE_LIST")
+log "packages available: $AVAILABLE (some may be held back by Ubuntu phasing)"
+[[ -n $AVAILABLE_LIST ]] && printf '%s\n' "$AVAILABLE_LIST" >>"$LOG_FILE"
+grep -qE '^(docker-ce|containerd\.io)/' <<<"$AVAILABLE_LIST" \
+  && log "Docker upgrade available: all containers will restart if it installs"
+
+log "apt-get upgrade"
+UPG_OUT="$(mktemp)"
+if ! apt-get upgrade "${APT_OPTS[@]}" >"$UPG_OUT" 2>&1; then
+  log "  FAILED: apt-get upgrade"
+  FAILED+=("apt-get upgrade")
+fi
+cat "$UPG_OUT" >>"$LOG_FILE"
+UPGRADED="$(grep -oE '^[0-9]+ upgraded' "$UPG_OUT" | grep -oE '^[0-9]+' | head -n1)"
+UPGRADED=${UPGRADED:-0}
+DOCKER_UPGRADE=no
+grep -qE '^Setting up (docker-ce|containerd\.io) ' "$UPG_OUT" && DOCKER_UPGRADE=yes
+rm -f "$UPG_OUT"
+log "packages upgraded: $UPGRADED (docker upgraded: $DOCKER_UPGRADE)"
+step "apt-get autoremove" apt-get autoremove "${APT_OPTS[@]}"
+step "apt-get clean" apt-get clean
+step "docker image prune (unused for 7+ days)" docker image prune -af --filter "until=$IMAGE_MIN_AGE"
+step "journald vacuum (keep $JOURNAL_KEEP)" journalctl --vacuum-time="$JOURNAL_KEEP"
+
+REBOOT=no
+if [[ -f /var/run/reboot-required ]]; then
+  REBOOT=yes
+  log "REBOOT REQUIRED by: $(tr '\n' ' ' </var/run/reboot-required.pkgs 2>/dev/null)"
+fi
+
+log "waiting ${SETTLE_SECONDS}s for containers to settle"
+sleep "$SETTLE_SECONDS"
+NOT_RUNNING="$(docker ps -a --filter status=exited --filter status=created --filter status=dead \
+               --format '{{.Names}}' | tr '\n' ' ' | sed 's/ *$//')"
+[[ -n $NOT_RUNNING ]] && log "containers NOT running: $NOT_RUNNING"
+
+SUMMARY="upgraded=$UPGRADED held=$(( AVAILABLE > UPGRADED ? AVAILABLE - UPGRADED : 0 )) docker=$DOCKER_UPGRADE reboot=$REBOOT"
+[[ -n $NOT_RUNNING ]] && SUMMARY+=" stopped=[$NOT_RUNNING]"
+
+if (( ${#FAILED[@]} == 0 )) && [[ -z $NOT_RUNNING ]]; then
+  log "SUCCESS: $SUMMARY"
+  notify up "OK $SUMMARY"
+  rc=0
+else
+  log "PROBLEMS: failed=[${FAILED[*]:-}] $SUMMARY"
+  notify down "update-ub problems: failed=[${FAILED[*]:-}] $SUMMARY"
+  rc=1
+fi
+log "==================== weekly maintenance end ======================"
+exit "$rc"
