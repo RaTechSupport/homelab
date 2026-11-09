@@ -56,6 +56,7 @@ Real incidents and changes, written up as context, root cause, fix and what chan
 4. **3-2-1 backups without giving the server cloud credentials**: public-key encryption, a pull model and a locked-down SFTP account, plus a restore test that failed first.
 5. **A major-version upgrade with a dry run**: Uptime Kuma v1 to v2, rehearsed on a copy of the database with networking disabled.
 6. **Measure before buying**: a week of ping data on the Wi-Fi backhaul and a VPN load test, used to decide where the real bottleneck is.
+7. **A DNSSEC false positive**: a one-day spike of failed lookups traced to my own resolver rejecting an unsigned streaming-service chain, proven against three public resolvers, with a zero-risk fix held back on purpose.
 
 ## Scripts
 

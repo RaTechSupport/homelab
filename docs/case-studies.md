@@ -104,3 +104,20 @@ Real incidents and changes on JARVIS, Oct-Nov 2026. Each one: context, what happ
 **Outcome.** The data points to the cable, a small UPS for the network gear, and later an own router with queue management (a bufferbloat test scored C), rather than a faster server. An hourly collector now keeps DNS, ad-blocking and DHCP statistics as CSV files for the same kind of decisions about blocklists.
 
 **Lesson.** Instrument first; let a week of data, not a hunch, decide where money goes.
+
+---
+
+## 7. A DNSSEC false positive: when "secure" quietly breaks streaming
+
+**Context.** The resolver validates DNSSEC: an answer whose signatures don't check out is refused (SERVFAIL) instead of being passed on. The new hourly statistics showed one day with **239 failed lookups**, against 0-26 on every other day.
+
+**Investigation.**
+- **Drill-down** (one query against Pi-hole's database, by hour, domain and client): 234 of the 239 were **one name**, a Prime Video API endpoint, requested by **one smart TV** within **one hour**. Its app had retried for an hour. Every other domain resolved normally that day, so it was not an outage.
+- **Live reproduction:** any *fresh* name under that Amazon subdomain still failed through my resolver. The same lookup with checking disabled (`dig +cd`) succeeded, which means my own validator was rejecting the answer.
+- **Cross-check:** Cloudflare, Google and Quad9, which also validate DNSSEC, all answered normally.
+- **Independent validation** with `delv +vtrace`: the whole chain is **unsigned** (no DS record for the domain), a five-step CNAME chain into a CDN with a 3-second TTL on one link. With nothing to validate, the correct verdict is "insecure", not "bogus".
+- Once every link of the chain was cached separately, the name resolved, which explains why the problem only shows up now and then.
+
+**Decision.** The fault is on my side: the validator mishandles this unusual (unsigned, multi-hop) chain; the exact reason wasn't logged at the time. I prepared a targeted fix: skip validation for that one domain only (`domain-insecure`; zero security cost, because the zone carries no signatures anyway) and turn on SERVFAIL reason logging so the next spike explains itself. Nobody had noticed a problem, so I chose to **monitor instead of changing a critical service**, with the diagnosis saved as ready-to-run queries and the fix documented.
+
+**Lesson.** Security controls can fail closed in surprising ways. Compare against independent validators before blaming the network or the provider, keep the evidence reproducible, and change critical configuration when the benefit outweighs the risk, not just because a fix exists.
